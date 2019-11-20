@@ -1,0 +1,2892 @@
+<?xml version="1.0" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg version="1.1" width="1200" height="2134" onload="init(evt)" viewBox="0 0 1200 2134" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+<!-- Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples. -->
+<!-- NOTES:  -->
+<defs>
+	<linearGradient id="background" y1="0" y2="1" x1="0" x2="0" >
+		<stop stop-color="#eeeeee" offset="5%" />
+		<stop stop-color="#eeeeb0" offset="95%" />
+	</linearGradient>
+</defs>
+<style type="text/css">
+	text { font-family:Verdana; font-size:12px; fill:rgb(0,0,0); }
+	#search, #ignorecase { opacity:0.1; cursor:pointer; }
+	#search:hover, #search.show, #ignorecase:hover, #ignorecase.show { opacity:1; }
+	#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+	#title { text-anchor:middle; font-size:17px}
+	#unzoom { cursor:pointer; }
+	#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+	.hide { display:none; }
+	.parent { opacity:0.5; }
+</style>
+<script type="text/ecmascript">
+<![CDATA[
+	"use strict";
+	var details, searchbtn, unzoombtn, matchedtxt, svg, searching, currentSearchTerm, ignorecase, ignorecaseBtn;
+	function init(evt) {
+		details = document.getElementById("details").firstChild;
+		searchbtn = document.getElementById("search");
+		ignorecaseBtn = document.getElementById("ignorecase");
+		unzoombtn = document.getElementById("unzoom");
+		matchedtxt = document.getElementById("matched");
+		svg = document.getElementsByTagName("svg")[0];
+		searching = 0;
+		currentSearchTerm = null;
+	}
+
+	window.addEventListener("click", function(e) {
+		var target = find_group(e.target);
+		if (target) {
+			if (target.nodeName == "a") {
+				if (e.ctrlKey === false) return;
+				e.preventDefault();
+			}
+			if (target.classList.contains("parent")) unzoom();
+			zoom(target);
+		}
+		else if (e.target.id == "unzoom") unzoom();
+		else if (e.target.id == "search") search_prompt();
+		else if (e.target.id == "ignorecase") toggle_ignorecase();
+	}, false)
+
+	// mouse-over for info
+	// show
+	window.addEventListener("mouseover", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = "Function: " + g_to_text(target);
+	}, false)
+
+	// clear
+	window.addEventListener("mouseout", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = ' ';
+	}, false)
+
+	// ctrl-F for search
+	window.addEventListener("keydown",function (e) {
+		if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+			e.preventDefault();
+			search_prompt();
+		}
+	}, false)
+
+	// ctrl-I to toggle case-sensitive search
+	window.addEventListener("keydown",function (e) {
+		if (e.ctrlKey && e.keyCode === 73) {
+			e.preventDefault();
+			toggle_ignorecase();
+		}
+	}, false)
+
+	// functions
+	function find_child(node, selector) {
+		var children = node.querySelectorAll(selector);
+		if (children.length) return children[0];
+		return;
+	}
+	function find_group(node) {
+		var parent = node.parentElement;
+		if (!parent) return;
+		if (parent.id == "frames") return node;
+		return find_group(parent);
+	}
+	function orig_save(e, attr, val) {
+		if (e.attributes["_orig_" + attr] != undefined) return;
+		if (e.attributes[attr] == undefined) return;
+		if (val == undefined) val = e.attributes[attr].value;
+		e.setAttribute("_orig_" + attr, val);
+	}
+	function orig_load(e, attr) {
+		if (e.attributes["_orig_"+attr] == undefined) return;
+		e.attributes[attr].value = e.attributes["_orig_" + attr].value;
+		e.removeAttribute("_orig_"+attr);
+	}
+	function g_to_text(e) {
+		var text = find_child(e, "title").firstChild.nodeValue;
+		return (text)
+	}
+	function g_to_func(e) {
+		var func = g_to_text(e);
+		// if there's any manipulation we want to do to the function
+		// name before it's searched, do it here before returning.
+		return (func);
+	}
+	function update_text(e) {
+		var r = find_child(e, "rect");
+		var t = find_child(e, "text");
+		var w = parseFloat(r.attributes.width.value) -3;
+		var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+		t.attributes.x.value = parseFloat(r.attributes.x.value) + 3;
+
+		// Smaller than this size won't fit anything
+		if (w < 2 * 12 * 0.59) {
+			t.textContent = "";
+			return;
+		}
+
+		t.textContent = txt;
+		// Fit in full text width
+		if (/^ *$/.test(txt) || t.getSubStringLength(0, txt.length) < w)
+			return;
+
+		for (var x = txt.length - 2; x > 0; x--) {
+			if (t.getSubStringLength(0, x + 2) <= w) {
+				t.textContent = txt.substring(0, x) + "..";
+				return;
+			}
+		}
+		t.textContent = "";
+	}
+
+	// zoom
+	function zoom_reset(e) {
+		if (e.attributes != undefined) {
+			orig_load(e, "x");
+			orig_load(e, "width");
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_reset(c[i]);
+		}
+	}
+	function zoom_child(e, x, ratio) {
+		if (e.attributes != undefined) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = (parseFloat(e.attributes.x.value) - x - 10) * ratio + 10;
+				if (e.tagName == "text")
+					e.attributes.x.value = find_child(e.parentNode, "rect[x]").attributes.x.value + 3;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseFloat(e.attributes.width.value) * ratio;
+			}
+		}
+
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_child(c[i], x - 10, ratio);
+		}
+	}
+	function zoom_parent(e) {
+		if (e.attributes) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = 10;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseInt(svg.width.baseVal.value) - (10 * 2);
+			}
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_parent(c[i]);
+		}
+	}
+	function zoom(node) {
+		var attr = find_child(node, "rect").attributes;
+		var width = parseFloat(attr.width.value);
+		var xmin = parseFloat(attr.x.value);
+		var xmax = parseFloat(xmin + width);
+		var ymin = parseFloat(attr.y.value);
+		var ratio = (svg.width.baseVal.value - 2 * 10) / width;
+
+		// XXX: Workaround for JavaScript float issues (fix me)
+		var fudge = 0.0001;
+
+		unzoombtn.classList.remove("hide");
+
+		var el = document.getElementById("frames").children;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var a = find_child(e, "rect").attributes;
+			var ex = parseFloat(a.x.value);
+			var ew = parseFloat(a.width.value);
+			var upstack;
+			// Is it an ancestor
+			if (0 == 0) {
+				upstack = parseFloat(a.y.value) > ymin;
+			} else {
+				upstack = parseFloat(a.y.value) < ymin;
+			}
+			if (upstack) {
+				// Direct ancestor
+				if (ex <= xmin && (ex+ew+fudge) >= xmax) {
+					e.classList.add("parent");
+					zoom_parent(e);
+					update_text(e);
+				}
+				// not in current path
+				else
+					e.classList.add("hide");
+			}
+			// Children maybe
+			else {
+				// no common path
+				if (ex < xmin || ex + fudge >= xmax) {
+					e.classList.add("hide");
+				}
+				else {
+					zoom_child(e, xmin, ratio);
+					update_text(e);
+				}
+			}
+		}
+		search();
+	}
+	function unzoom() {
+		unzoombtn.classList.add("hide");
+		var el = document.getElementById("frames").children;
+		for(var i = 0; i < el.length; i++) {
+			el[i].classList.remove("parent");
+			el[i].classList.remove("hide");
+			zoom_reset(el[i]);
+			update_text(el[i]);
+		}
+		search();
+	}
+
+	// search
+	function toggle_ignorecase() {
+		ignorecase = !ignorecase;
+		if (ignorecase) {
+			ignorecaseBtn.classList.add("show");
+		} else {
+			ignorecaseBtn.classList.remove("show");
+		}
+		reset_search();
+		search();
+	}
+	function reset_search() {
+		var el = document.querySelectorAll("#frames rect");
+		for (var i = 0; i < el.length; i++) {
+			orig_load(el[i], "fill")
+		}
+	}
+	function search_prompt() {
+		if (!searching) {
+			var term = prompt("Enter a search term (regexp " +
+			    "allowed, eg: ^ext4_)"
+			    + (ignorecase ? ", ignoring case" : "")
+			    + "\nPress Ctrl-i to toggle case sensitivity", "");
+			if (term != null) {
+				currentSearchTerm = term;
+				search();
+			}
+		} else {
+			reset_search();
+			searching = 0;
+			currentSearchTerm = null;
+			searchbtn.classList.remove("show");
+			searchbtn.firstChild.nodeValue = "Search"
+			matchedtxt.classList.add("hide");
+			matchedtxt.firstChild.nodeValue = ""
+		}
+	}
+	function search(term) {
+		if (currentSearchTerm === null) return;
+		var term = currentSearchTerm;
+
+		var re = new RegExp(term, ignorecase ? 'i' : '');
+		var el = document.getElementById("frames").children;
+		var matches = new Object();
+		var maxwidth = 0;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var func = g_to_func(e);
+			var rect = find_child(e, "rect");
+			if (func == null || rect == null)
+				continue;
+
+			// Save max width. Only works as we have a root frame
+			var w = parseFloat(rect.attributes.width.value);
+			if (w > maxwidth)
+				maxwidth = w;
+
+			if (func.match(re)) {
+				// highlight
+				var x = parseFloat(rect.attributes.x.value);
+				orig_save(rect, "fill");
+				rect.attributes.fill.value = "rgb(230,0,230)";
+
+				// remember matches
+				if (matches[x] == undefined) {
+					matches[x] = w;
+				} else {
+					if (w > matches[x]) {
+						// overwrite with parent
+						matches[x] = w;
+					}
+				}
+				searching = 1;
+			}
+		}
+		if (!searching)
+			return;
+
+		searchbtn.classList.add("show");
+		searchbtn.firstChild.nodeValue = "Reset Search";
+
+		// calculate percent matched, excluding vertical overlap
+		var count = 0;
+		var lastx = -1;
+		var lastw = 0;
+		var keys = Array();
+		for (k in matches) {
+			if (matches.hasOwnProperty(k))
+				keys.push(k);
+		}
+		// sort the matched frames by their x location
+		// ascending, then width descending
+		keys.sort(function(a, b){
+			return a - b;
+		});
+		// Step through frames saving only the biggest bottom-up frames
+		// thanks to the sort order. This relies on the tree property
+		// where children are always smaller than their parents.
+		var fudge = 0.0001;	// JavaScript floating point
+		for (var k in keys) {
+			var x = parseFloat(keys[k]);
+			var w = matches[keys[k]];
+			if (x >= lastx + lastw - fudge) {
+				count += w;
+				lastx = x;
+				lastw = w;
+			}
+		}
+		// display matched percent
+		matchedtxt.classList.remove("hide");
+		var pct = 100 * count / maxwidth;
+		if (pct != 100) pct = pct.toFixed(1)
+		matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+	}
+]]>
+</script>
+<rect x="0.0" y="0" width="1200.0" height="2134.0" fill="url(#background)"  />
+<text id="title" x="600.00" y="24" >Flame Graph</text>
+<text id="details" x="10.00" y="2117" > </text>
+<text id="unzoom" x="10.00" y="24" class="hide">Reset Zoom</text>
+<text id="search" x="1090.00" y="24" >Search</text>
+<text id="ignorecase" x="1174.00" y="24" >ic</text>
+<text id="matched" x="1090.00" y="2117" > </text>
+<g id="frames">
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="354.2" y="1349" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="357.17" y="1359.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>Builtin:JSBuiltinsConstructStub (2 samples, 8.33%)</title><rect x="354.2" y="1157" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="357.17" y="1167.5" >Builtin:JSB..</text>
+</g>
+<g >
+<title>Builtin:ToString (1 samples, 4.17%)</title><rect x="157.5" y="1765" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="160.50" y="1775.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="293" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="303.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:StringPrototypeSplit (1 samples, 4.17%)</title><rect x="895.0" y="1205" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="898.00" y="1215.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:CEntry_Return1_DontSaveFPRegs_ArgvOnStack_NoBuiltinExit (1 samples, 4.17%)</title><rect x="895.0" y="1429" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="898.00" y="1439.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="1173" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="1183.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:ArgumentsAdaptorTrampoline (1 samples, 4.17%)</title><rect x="993.3" y="853" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="996.33" y="863.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (3 samples, 12.50%)</title><rect x="59.2" y="1781" width="147.5" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="62.17" y="1791.5" >Builtin:Interprete..</text>
+</g>
+<g >
+<title>v8::internal::KeyAccumulator::CollectOwnPropertyNames (1 samples, 4.17%)</title><rect x="845.8" y="645" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="848.83" y="655.5" >v8::..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="993.3" y="1413" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="996.33" y="1423.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="1557" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="1567.5" >Buil..</text>
+</g>
+<g >
+<title>Handler:UnknownBytecodeHadler (1 samples, 4.17%)</title><rect x="403.3" y="709" width="49.2" height="15.0" fill="rgb(92,203,203)" rx="2" ry="2" />
+<text  x="406.33" y="719.5" >Hand..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="165" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="175.5" >Buil..</text>
+</g>
+<g >
+<title>node::StreamBase::CallJSOnreadMethod (3 samples, 12.50%)</title><rect x="895.0" y="1877" width="147.5" height="15.0" fill="rgb(225,225,68)" rx="2" ry="2" />
+<text  x="898.00" y="1887.5" >node::StreamBase::..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="1029" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="1039.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:ArgumentsAdaptorTrampoline (1 samples, 4.17%)</title><rect x="698.3" y="1589" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="701.33" y="1599.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:ArgumentsAdaptorTrampoline (1 samples, 4.17%)</title><rect x="993.3" y="949" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="996.33" y="959.5" >Buil..</text>
+</g>
+<g >
+<title>v8::internal::(anonymous namespace)::HandleApiCallHelper&lt;true&gt; (1 samples, 4.17%)</title><rect x="698.3" y="1349" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="701.33" y="1359.5" >v8::..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="354.2" y="933" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="357.17" y="943.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>Builtin:JSEntryTrampoline (3 samples, 12.50%)</title><rect x="59.2" y="1797" width="147.5" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="62.17" y="1807.5" >Builtin:JSEntryTra..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="354.2" y="1333" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="357.17" y="1343.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="1125" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="1135.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="1813" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="1823.5" >Buil..</text>
+</g>
+<g >
+<title>v8::internal::Factory::CopyJSObjectWithAllocationSite (1 samples, 4.17%)</title><rect x="698.3" y="1301" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="701.33" y="1311.5" >v8::..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="993.3" y="1429" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="996.33" y="1439.5" >Buil..</text>
+</g>
+<g >
+<title>v8::internal::LookupIterator::LookupInRegularHolder&lt;false&gt; (1 samples, 4.17%)</title><rect x="354.2" y="597" width="49.1" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="357.17" y="607.5" >v8::..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="354.2" y="1189" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="357.17" y="1199.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>Builtin:ArgumentsAdaptorTrampoline (1 samples, 4.17%)</title><rect x="255.8" y="1605" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="258.83" y="1615.5" >Buil..</text>
+</g>
+<g >
+<title>v8::internal::FastKeyAccumulator::GetKeys (1 samples, 4.17%)</title><rect x="845.8" y="693" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="848.83" y="703.5" >v8::..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="59.2" y="1109" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="62.17" y="1119.5" >Buil..</text>
+</g>
+<g >
+<title>node::InternalCallbackScope::Close (1 samples, 4.17%)</title><rect x="1140.8" y="1909" width="49.2" height="15.0" fill="rgb(225,225,68)" rx="2" ry="2" />
+<text  x="1143.83" y="1919.5" >node..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="1557" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="1567.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="895.0" y="1557" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="898.00" y="1567.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="1621" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="1631.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="10.0" y="1765" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="13.00" y="1775.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:ArgumentsAdaptorTrampoline (5 samples, 20.83%)</title><rect x="452.5" y="1445" width="245.8" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="455.50" y="1455.5" >Builtin:ArgumentsAdaptorTrampoline</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="993.3" y="1317" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="996.33" y="1327.5" >Buil..</text>
+</g>
+<g >
+<title>v8::internal::KeyAccumulator::CollectKeys (1 samples, 4.17%)</title><rect x="845.8" y="677" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="848.83" y="687.5" >v8::..</text>
+</g>
+<g >
+<title>__lock_text_start (1 samples, 4.17%)</title><rect x="698.3" y="1045" width="49.2" height="15.0" fill="rgb(233,133,0)" rx="2" ry="2" />
+<text  x="701.33" y="1055.5" >__lo..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="354.2" y="965" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="357.17" y="975.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>v8::internal::Runtime_StoreIC_Miss (1 samples, 4.17%)</title><rect x="354.2" y="645" width="49.1" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="357.17" y="655.5" >v8::..</text>
+</g>
+<g >
+<title>node::TLSWrap::OnStreamRead (1 samples, 4.17%)</title><rect x="1140.8" y="2005" width="49.2" height="15.0" fill="rgb(225,225,68)" rx="2" ry="2" />
+<text  x="1143.83" y="2015.5" >node..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="1573" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="1583.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="1333" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="1343.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="10.0" y="1797" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="13.00" y="1807.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="1333" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="1343.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:ArgumentsAdaptorTrampoline (3 samples, 12.50%)</title><rect x="452.5" y="1381" width="147.5" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="455.50" y="1391.5" >Builtin:ArgumentsA..</text>
+</g>
+<g >
+<title>BytecodeHandler:ForInEnumerate (1 samples, 4.17%)</title><rect x="845.8" y="741" width="49.2" height="15.0" fill="rgb(90,202,202)" rx="2" ry="2" />
+<text  x="848.83" y="751.5" >Byte..</text>
+</g>
+<g >
+<title>v8::internal::Factory::CopyJSObject (1 samples, 4.17%)</title><rect x="698.3" y="1317" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="701.33" y="1327.5" >v8::..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="981" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="991.5" >Buil..</text>
+</g>
+<g >
+<title>node::Start (23 samples, 95.83%)</title><rect x="10.0" y="2021" width="1130.8" height="15.0" fill="rgb(225,225,68)" rx="2" ry="2" />
+<text  x="13.00" y="2031.5" >node::Start</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="1365" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="1375.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="354.2" y="1285" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="357.17" y="1295.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>Builtin:ArgumentsAdaptorTrampoline (2 samples, 8.33%)</title><rect x="354.2" y="1109" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="357.17" y="1119.5" >Builtin:Arg..</text>
+</g>
+<g >
+<title>node::AsyncWrap::MakeCallback (3 samples, 12.50%)</title><rect x="59.2" y="1877" width="147.5" height="15.0" fill="rgb(225,225,68)" rx="2" ry="2" />
+<text  x="62.17" y="1887.5" >node::AsyncWrap::M..</text>
+</g>
+<g >
+<title>uv_run (23 samples, 95.83%)</title><rect x="10.0" y="2005" width="1130.8" height="15.0" fill="rgb(223,84,84)" rx="2" ry="2" />
+<text  x="13.00" y="2015.5" >uv_run</text>
+</g>
+<g >
+<title>v8::internal::Builtin_HandleApiCall (1 samples, 4.17%)</title><rect x="1140.8" y="1781" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="1143.83" y="1791.5" >v8::..</text>
+</g>
+<g >
+<title>v8::internal::Execution::Call (1 samples, 4.17%)</title><rect x="10.0" y="1845" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="13.00" y="1855.5" >v8::..</text>
+</g>
+<g >
+<title>node::EmitToJSStreamListener::OnStreamRead (3 samples, 12.50%)</title><rect x="895.0" y="1893" width="147.5" height="15.0" fill="rgb(225,225,68)" rx="2" ry="2" />
+<text  x="898.00" y="1903.5" >node::EmitToJSStre..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="354.2" y="709" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="357.17" y="719.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="1157" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="1167.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="993.3" y="741" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="996.33" y="751.5" >Buil..</text>
+</g>
+<g >
+<title>v8::internal::compiler::GraphReducer::ReduceNode (1 samples, 4.17%)</title><rect x="10.0" y="1493" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="13.00" y="1503.5" >v8::..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="354.2" y="805" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="357.17" y="815.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="59.2" y="1685" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="62.17" y="1695.5" >Buil..</text>
+</g>
+<g >
+<title>node::EmitToJSStreamListener::OnStreamRead (1 samples, 4.17%)</title><rect x="1140.8" y="1973" width="49.2" height="15.0" fill="rgb(225,225,68)" rx="2" ry="2" />
+<text  x="1143.83" y="1983.5" >node..</text>
+</g>
+<g >
+<title>Stub:JSEntryStub (3 samples, 12.50%)</title><rect x="59.2" y="1813" width="147.5" height="15.0" fill="rgb(88,200,200)" rx="2" ry="2" />
+<text  x="62.17" y="1823.5" >Stub:JSEntryStub</text>
+</g>
+<g >
+<title>v8::internal::Execution::Call (3 samples, 12.50%)</title><rect x="895.0" y="1781" width="147.5" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="898.00" y="1791.5" >v8::internal::Exec..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="993.3" y="821" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="996.33" y="831.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="354.2" y="1445" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="357.17" y="1455.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>node::Environment::CheckImmediate (1 samples, 4.17%)</title><rect x="1042.5" y="1973" width="49.2" height="15.0" fill="rgb(225,225,68)" rx="2" ry="2" />
+<text  x="1045.50" y="1983.5" >node..</text>
+</g>
+<g >
+<title>v8::internal::Builtin_HandleApiCall (1 samples, 4.17%)</title><rect x="698.3" y="1365" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="701.33" y="1375.5" >v8::..</text>
+</g>
+<g >
+<title>v8::Function::Call (3 samples, 12.50%)</title><rect x="59.2" y="1845" width="147.5" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="62.17" y="1855.5" >v8::Function::Call</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="59.2" y="1445" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="62.17" y="1455.5" >Buil..</text>
+</g>
+<g >
+<title>Handler:UnknownBytecodeHadler (1 samples, 4.17%)</title><rect x="895.0" y="1477" width="49.2" height="15.0" fill="rgb(92,203,203)" rx="2" ry="2" />
+<text  x="898.00" y="1487.5" >Hand..</text>
+</g>
+<g >
+<title>Builtin:ArgumentsAdaptorTrampoline (2 samples, 8.33%)</title><rect x="354.2" y="1301" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="357.17" y="1311.5" >Builtin:Arg..</text>
+</g>
+<g >
+<title>Builtin:JSEntryTrampoline (1 samples, 4.17%)</title><rect x="895.0" y="1285" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="898.00" y="1295.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="993.3" y="1269" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="996.33" y="1279.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="993.3" y="1493" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="996.33" y="1503.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:CEntry_Return1_DontSaveFPRegs_ArgvOnStack_NoBuiltinExit (3 samples, 12.50%)</title><rect x="895.0" y="1717" width="147.5" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="898.00" y="1727.5" >Builtin:CEntry_Ret..</text>
+</g>
+<g >
+<title>Handler:UnknownBytecodeHadler (2 samples, 8.33%)</title><rect x="354.2" y="1173" width="98.3" height="15.0" fill="rgb(92,203,203)" rx="2" ry="2" />
+<text  x="357.17" y="1183.5" >Handler:Unk..</text>
+</g>
+<g >
+<title>Builtin:CEntry_Return1_DontSaveFPRegs_ArgvOnStack_NoBuiltinExit (1 samples, 4.17%)</title><rect x="993.3" y="693" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="996.33" y="703.5" >Buil..</text>
+</g>
+<g >
+<title>node::(anonymous namespace)::CompressionStream&lt;node::(anonymous namespace)::ZlibContext&gt;::AfterThreadPoolWork (1 samples, 4.17%)</title><rect x="10.0" y="1941" width="49.2" height="15.0" fill="rgb(225,225,68)" rx="2" ry="2" />
+<text  x="13.00" y="1951.5" >node..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="993.3" y="1141" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="996.33" y="1151.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:PromiseConstructor (2 samples, 8.33%)</title><rect x="354.2" y="1141" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="357.17" y="1151.5" >Builtin:Pro..</text>
+</g>
+<g >
+<title>wake_up_q (1 samples, 4.17%)</title><rect x="698.3" y="1077" width="49.2" height="15.0" fill="rgb(211,111,0)" rx="2" ry="2" />
+<text  x="701.33" y="1087.5" >wake..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (13 samples, 54.17%)</title><rect x="255.8" y="1781" width="639.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="258.83" y="1791.5" >Builtin:InterpreterEntryTrampoline</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="698.3" y="1541" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="701.33" y="1551.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="354.2" y="917" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="357.17" y="927.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>Builtin:ArgumentsAdaptorTrampoline (1 samples, 4.17%)</title><rect x="895.0" y="1541" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="898.00" y="1551.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="305.0" y="1461" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="308.00" y="1471.5" >Buil..</text>
+</g>
+<g >
+<title>v8::internal::(anonymous namespace)::HandleApiCallHelper&lt;false&gt; (1 samples, 4.17%)</title><rect x="1140.8" y="1765" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="1143.83" y="1775.5" >v8::..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="10.0" y="1685" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="13.00" y="1695.5" >Buil..</text>
+</g>
+<g >
+<title>v8::internal::Object::GetPropertyWithAccessor (1 samples, 4.17%)</title><rect x="600.0" y="1301" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="603.00" y="1311.5" >v8::..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="1589" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="1599.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="993.3" y="1061" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="996.33" y="1071.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:JSEntryTrampoline (3 samples, 12.50%)</title><rect x="895.0" y="1749" width="147.5" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="898.00" y="1759.5" >Builtin:JSEntryTra..</text>
+</g>
+<g >
+<title>v8::internal::(anonymous namespace)::HandleApiCallHelper&lt;false&gt; (1 samples, 4.17%)</title><rect x="944.2" y="1445" width="49.1" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="947.17" y="1455.5" >v8::..</text>
+</g>
+<g >
+<title>do_futex (1 samples, 4.17%)</title><rect x="698.3" y="1109" width="49.2" height="15.0" fill="rgb(243,143,0)" rx="2" ry="2" />
+<text  x="701.33" y="1119.5" >do_f..</text>
+</g>
+<g >
+<title>node::TLSWrap::ClearOut (3 samples, 12.50%)</title><rect x="895.0" y="1909" width="147.5" height="15.0" fill="rgb(225,225,68)" rx="2" ry="2" />
+<text  x="898.00" y="1919.5" >node::TLSWrap::Cle..</text>
+</g>
+<g >
+<title>v8::internal::Isolate::RunMicrotasks (13 samples, 54.17%)</title><rect x="255.8" y="1717" width="639.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="258.83" y="1727.5" >v8::internal::Isolate::RunMicrotasks</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="993.3" y="1029" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="996.33" y="1039.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="354.2" y="1269" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="357.17" y="1279.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="895.0" y="1269" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="898.00" y="1279.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="277" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="287.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (3 samples, 12.50%)</title><rect x="305.0" y="1493" width="147.5" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="308.00" y="1503.5" >Builtin:Interprete..</text>
+</g>
+<g >
+<title>Builtin:ArgumentsAdaptorTrampoline (1 samples, 4.17%)</title><rect x="59.2" y="1749" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="62.17" y="1759.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="354.2" y="869" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="357.17" y="879.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="698.3" y="1445" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="701.33" y="1455.5" >Buil..</text>
+</g>
+<g >
+<title>v8::internal::(anonymous namespace)::GetIdentityHashHelper (1 samples, 4.17%)</title><rect x="59.2" y="981" width="49.1" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="62.17" y="991.5" >v8::..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (3 samples, 12.50%)</title><rect x="305.0" y="1525" width="147.5" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="308.00" y="1535.5" >Builtin:Interprete..</text>
+</g>
+<g >
+<title>v8::Function::Call (3 samples, 12.50%)</title><rect x="895.0" y="1813" width="147.5" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="898.00" y="1823.5" >v8::Function::Call</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="789" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="799.5" >Buil..</text>
+</g>
+<g >
+<title>node::AsyncWrap::MakeCallback (13 samples, 54.17%)</title><rect x="255.8" y="1909" width="639.2" height="15.0" fill="rgb(225,225,68)" rx="2" ry="2" />
+<text  x="258.83" y="1919.5" >node::AsyncWrap::MakeCallback</text>
+</g>
+<g >
+<title>v8::internal::(anonymous namespace)::GetFastEnumPropertyKeys (1 samples, 4.17%)</title><rect x="845.8" y="613" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="848.83" y="623.5" >v8::..</text>
+</g>
+<g >
+<title>node::(anonymous namespace)::Parser::OnStreamRead (17 samples, 70.83%)</title><rect x="59.2" y="1925" width="835.8" height="15.0" fill="rgb(225,225,68)" rx="2" ry="2" />
+<text  x="62.17" y="1935.5" >node::(anonymous namespace)::Parser::OnStreamRead</text>
+</g>
+<g >
+<title>Builtin:ArgumentsAdaptorTrampoline (1 samples, 4.17%)</title><rect x="993.3" y="1077" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="996.33" y="1087.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="698.3" y="1605" width="98.4" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="701.33" y="1615.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="1109" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="1119.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="59.2" y="1541" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="62.17" y="1551.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="85" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="95.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="757" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="767.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="1253" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="1263.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="1317" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="1327.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="354.2" y="1093" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="357.17" y="1103.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="901" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="911.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="1285" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="1295.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="725" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="735.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="59.2" y="1461" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="62.17" y="1471.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="698.3" y="1461" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="701.33" y="1471.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="10.0" y="1701" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="13.00" y="1711.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="1397" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="1407.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="965" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="975.5" >Buil..</text>
+</g>
+<g >
+<title>v8::internal::compiler::PipelineImpl::CreateGraph (1 samples, 4.17%)</title><rect x="10.0" y="1541" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="13.00" y="1551.5" >v8::..</text>
+</g>
+<g >
+<title>node::InternalMakeCallback (1 samples, 4.17%)</title><rect x="1140.8" y="1925" width="49.2" height="15.0" fill="rgb(225,225,68)" rx="2" ry="2" />
+<text  x="1143.83" y="1935.5" >node..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="59.2" y="1253" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="62.17" y="1263.5" >Buil..</text>
+</g>
+<g >
+<title>node::TLSWrap::ClearOut (1 samples, 4.17%)</title><rect x="1140.8" y="1989" width="49.2" height="15.0" fill="rgb(225,225,68)" rx="2" ry="2" />
+<text  x="1143.83" y="1999.5" >node..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="1605" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="1615.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="649.2" y="1349" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="652.17" y="1359.5" >Buil..</text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (1 samples, 4.17%)</title><rect x="698.3" y="1157" width="49.2" height="15.0" fill="rgb(245,145,0)" rx="2" ry="2" />
+<text  x="701.33" y="1167.5" >entr..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="993.3" y="1205" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="996.33" y="1215.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="53" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="63.5" >Buil..</text>
+</g>
+<g >
+<title>Handler:UnknownBytecodeHadler (1 samples, 4.17%)</title><rect x="649.2" y="1317" width="49.1" height="15.0" fill="rgb(92,203,203)" rx="2" ry="2" />
+<text  x="652.17" y="1327.5" >Hand..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="993.3" y="1109" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="996.33" y="1119.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="805" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="815.5" >Buil..</text>
+</g>
+<g >
+<title>v8::internal::KeyAccumulator::CollectOwnKeys (1 samples, 4.17%)</title><rect x="845.8" y="661" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="848.83" y="671.5" >v8::..</text>
+</g>
+<g >
+<title>[libc-2.19.so] (1 samples, 4.17%)</title><rect x="944.2" y="1413" width="49.1" height="15.0" fill="rgb(235,101,101)" rx="2" ry="2" />
+<text  x="947.17" y="1423.5" >[lib..</text>
+</g>
+<g >
+<title>v8::internal::Runtime_ForInEnumerate (1 samples, 4.17%)</title><rect x="501.7" y="1157" width="49.1" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="504.67" y="1167.5" >v8::..</text>
+</g>
+<g >
+<title>v8::Function::Call (1 samples, 4.17%)</title><rect x="10.0" y="1861" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="13.00" y="1871.5" >v8::..</text>
+</g>
+<g >
+<title>Builtin:GeneratorPrototypeNext (3 samples, 12.50%)</title><rect x="698.3" y="1621" width="147.5" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="701.33" y="1631.5" >Builtin:GeneratorP..</text>
+</g>
+<g >
+<title>uv__read (20 samples, 83.33%)</title><rect x="59.2" y="1957" width="983.3" height="15.0" fill="rgb(223,84,84)" rx="2" ry="2" />
+<text  x="62.17" y="1967.5" >uv__read</text>
+</g>
+<g >
+<title>node::InternalCallbackScope::Close (3 samples, 12.50%)</title><rect x="895.0" y="1829" width="147.5" height="15.0" fill="rgb(225,225,68)" rx="2" ry="2" />
+<text  x="898.00" y="1839.5" >node::InternalCall..</text>
+</g>
+<g >
+<title>Builtin:LoadIC_Noninlined (1 samples, 4.17%)</title><rect x="649.2" y="1237" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="652.17" y="1247.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="993.3" y="1509" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="996.33" y="1519.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="1269" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="1279.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="1301" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="1311.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="255.8" y="1557" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="258.83" y="1567.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="517" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="527.5" >Buil..</text>
+</g>
+<g >
+<title>v8::Function::Call (1 samples, 4.17%)</title><rect x="10.0" y="1877" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="13.00" y="1887.5" >v8::..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (5 samples, 20.83%)</title><rect x="452.5" y="1541" width="245.8" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="455.50" y="1551.5" >Builtin:InterpreterEntryTrampoline</text>
+</g>
+<g >
+<title>async_page_fault (1 samples, 4.17%)</title><rect x="895.0" y="1173" width="49.2" height="15.0" fill="rgb(231,131,0)" rx="2" ry="2" />
+<text  x="898.00" y="1183.5" >asyn..</text>
+</g>
+<g >
+<title>Builtin:ArgumentsAdaptorTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="821" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="831.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:JSConstructStubGeneric (1 samples, 4.17%)</title><rect x="649.2" y="1301" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="652.17" y="1311.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="354.2" y="1317" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="357.17" y="1327.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>v8::Function::Call (1 samples, 4.17%)</title><rect x="1140.8" y="1877" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="1143.83" y="1887.5" >v8::..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="261" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="271.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="305.0" y="1445" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="308.00" y="1455.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="354.2" y="1253" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="357.17" y="1263.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="452.5" y="1269" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="455.50" y="1279.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>v8::internal::ItemParallelJob::Task::RunInternal (1 samples, 4.17%)</title><rect x="698.3" y="1205" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="701.33" y="1215.5" >v8::..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="453" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="463.5" >Buil..</text>
+</g>
+<g >
+<title>__libc_start_main (23 samples, 95.83%)</title><rect x="10.0" y="2053" width="1130.8" height="15.0" fill="rgb(236,103,103)" rx="2" ry="2" />
+<text  x="13.00" y="2063.5" >__libc_start_main</text>
+</g>
+<g >
+<title>Handler:UnknownBytecodeHadler (1 samples, 4.17%)</title><rect x="59.2" y="1045" width="49.1" height="15.0" fill="rgb(92,203,203)" rx="2" ry="2" />
+<text  x="62.17" y="1055.5" >Hand..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="944.2" y="1525" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="947.17" y="1535.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>__do_page_fault (1 samples, 4.17%)</title><rect x="895.0" y="1157" width="49.2" height="15.0" fill="rgb(230,130,0)" rx="2" ry="2" />
+<text  x="898.00" y="1167.5" >__do..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="389" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="399.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (3 samples, 12.50%)</title><rect x="305.0" y="1509" width="147.5" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="308.00" y="1519.5" >Builtin:Interprete..</text>
+</g>
+<g >
+<title>Builtin:CEntry_Return1_DontSaveFPRegs_ArgvOnStack_NoBuiltinExit (1 samples, 4.17%)</title><rect x="59.2" y="1029" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="62.17" y="1039.5" >Buil..</text>
+</g>
+<g >
+<title>handle_mm_fault (1 samples, 4.17%)</title><rect x="895.0" y="1141" width="49.2" height="15.0" fill="rgb(231,131,0)" rx="2" ry="2" />
+<text  x="898.00" y="1151.5" >hand..</text>
+</g>
+<g >
+<title>Builtin:JSBuiltinsConstructStub (1 samples, 4.17%)</title><rect x="698.3" y="1397" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="701.33" y="1407.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="1445" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="1455.5" >Buil..</text>
+</g>
+<g >
+<title>v8::internal::Heap::Scavenge (1 samples, 4.17%)</title><rect x="698.3" y="1237" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="701.33" y="1247.5" >v8::..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="501" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="511.5" >Buil..</text>
+</g>
+<g >
+<title>v8::internal::(anonymous namespace)::ExecuteUnoptimizedCompileJobs (1 samples, 4.17%)</title><rect x="452.5" y="1125" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="455.50" y="1135.5" >v8::..</text>
+</g>
+<g >
+<title>uv__io_poll (21 samples, 87.50%)</title><rect x="10.0" y="1989" width="1032.5" height="15.0" fill="rgb(223,84,84)" rx="2" ry="2" />
+<text  x="13.00" y="1999.5" >uv__io_poll</text>
+</g>
+<g >
+<title>node::StreamBase::CallJSOnreadMethod (1 samples, 4.17%)</title><rect x="1140.8" y="1957" width="49.2" height="15.0" fill="rgb(225,225,68)" rx="2" ry="2" />
+<text  x="1143.83" y="1967.5" >node..</text>
+</g>
+<g >
+<title>Builtin:ArgumentsAdaptorTrampoline (1 samples, 4.17%)</title><rect x="59.2" y="1349" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="62.17" y="1359.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:PromiseConstructor (5 samples, 20.83%)</title><rect x="452.5" y="1557" width="245.8" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="455.50" y="1567.5" >Builtin:PromiseConstructor</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="895.0" y="1493" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="898.00" y="1503.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:CompileLazy (1 samples, 4.17%)</title><rect x="452.5" y="1221" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="455.50" y="1231.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:CEntry_Return1_DontSaveFPRegs_ArgvOnStack_NoBuiltinExit (1 samples, 4.17%)</title><rect x="944.2" y="1477" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="947.17" y="1487.5" >Buil..</text>
+</g>
+<g >
+<title>v8::internal::Runtime_AddDictionaryProperty (1 samples, 4.17%)</title><rect x="59.2" y="1013" width="49.1" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="62.17" y="1023.5" >v8::..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="59.2" y="1589" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="62.17" y="1599.5" >Buil..</text>
+</g>
+<g >
+<title>futex_requeue (1 samples, 4.17%)</title><rect x="698.3" y="1093" width="49.2" height="15.0" fill="rgb(233,133,0)" rx="2" ry="2" />
+<text  x="701.33" y="1103.5" >fute..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="59.2" y="1621" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="62.17" y="1631.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="993.3" y="1349" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="996.33" y="1359.5" >Buil..</text>
+</g>
+<g >
+<title>v8::internal::Isolate::RunMicrotasks (1 samples, 4.17%)</title><rect x="1140.8" y="1749" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="1143.83" y="1759.5" >v8::..</text>
+</g>
+<g >
+<title>v8::internal::ItemParallelJob::Run (1 samples, 4.17%)</title><rect x="698.3" y="1221" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="701.33" y="1231.5" >v8::..</text>
+</g>
+<g >
+<title>Handler:UnknownBytecodeHadler (1 samples, 4.17%)</title><rect x="895.0" y="1445" width="49.2" height="15.0" fill="rgb(92,203,203)" rx="2" ry="2" />
+<text  x="898.00" y="1455.5" >Hand..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="354.2" y="1029" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="357.17" y="1039.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>v8::internal::(anonymous namespace)::GenerateUnoptimizedCode (1 samples, 4.17%)</title><rect x="452.5" y="1141" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="455.50" y="1151.5" >v8::..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="1477" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="1487.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="1221" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="1231.5" >Buil..</text>
+</g>
+<g >
+<title>v8::internal::interpreter::BytecodeGenerator::GenerateBytecodeBody (1 samples, 4.17%)</title><rect x="452.5" y="1077" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="455.50" y="1087.5" >v8::..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="59.2" y="1477" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="62.17" y="1487.5" >Buil..</text>
+</g>
+<g >
+<title>v8::internal::KeyAccumulator::GetOwnEnumPropertyKeys (1 samples, 4.17%)</title><rect x="845.8" y="629" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="848.83" y="639.5" >v8::..</text>
+</g>
+<g >
+<title>v8::internal::KeyedLoadIC::Load (1 samples, 4.17%)</title><rect x="895.0" y="1397" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="898.00" y="1407.5" >v8::..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (3 samples, 12.50%)</title><rect x="305.0" y="1557" width="147.5" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="308.00" y="1567.5" >Builtin:Interprete..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="354.2" y="1061" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="357.17" y="1071.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="1269" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="1279.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="59.2" y="1525" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="62.17" y="1535.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="1141" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="1151.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:ArgumentsAdaptorTrampoline (1 samples, 4.17%)</title><rect x="698.3" y="1525" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="701.33" y="1535.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="581" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="591.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:PromiseConstructor (1 samples, 4.17%)</title><rect x="59.2" y="1285" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="62.17" y="1295.5" >Buil..</text>
+</g>
+<g >
+<title>node::LibuvStreamWrap::ReadStart (20 samples, 83.33%)</title><rect x="59.2" y="1941" width="983.3" height="15.0" fill="rgb(225,225,68)" rx="2" ry="2" />
+<text  x="62.17" y="1951.5" >node::LibuvStreamWrap::ReadStart</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="1397" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="1407.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="1013" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="1023.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:ArgumentsAdaptorTrampoline (1 samples, 4.17%)</title><rect x="59.2" y="1429" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="62.17" y="1439.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="993.3" y="1285" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="996.33" y="1295.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:RegExpSplit (1 samples, 4.17%)</title><rect x="895.0" y="1189" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="898.00" y="1199.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="698.3" y="1477" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="701.33" y="1487.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="869" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="879.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="1381" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="1391.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (3 samples, 12.50%)</title><rect x="452.5" y="1397" width="147.5" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="455.50" y="1407.5" >Builtin:Interprete..</text>
+</g>
+<g >
+<title>v8::internal::JSObject::MakePrototypesFast (1 samples, 4.17%)</title><rect x="993.3" y="645" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="996.33" y="655.5" >v8::..</text>
+</g>
+<g >
+<title>v8::internal::(anonymous namespace)::GetFastEnumPropertyKeys (1 samples, 4.17%)</title><rect x="501.7" y="1093" width="49.1" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="504.67" y="1103.5" >v8::..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="452.5" y="1301" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="455.50" y="1311.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="837" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="847.5" >Buil..</text>
+</g>
+<g >
+<title>node::AsyncWrap::MakeCallback (1 samples, 4.17%)</title><rect x="1140.8" y="1941" width="49.2" height="15.0" fill="rgb(225,225,68)" rx="2" ry="2" />
+<text  x="1143.83" y="1951.5" >node..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="709" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="719.5" >Buil..</text>
+</g>
+<g >
+<title>v8::internal::Runtime_LoadIC_Miss (1 samples, 4.17%)</title><rect x="600.0" y="1349" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="603.00" y="1359.5" >v8::..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="354.2" y="1381" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="357.17" y="1391.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (3 samples, 12.50%)</title><rect x="305.0" y="1589" width="147.5" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="308.00" y="1599.5" >Builtin:Interprete..</text>
+</g>
+<g >
+<title>v8::internal::Execution::RunMicrotasks (3 samples, 12.50%)</title><rect x="895.0" y="1653" width="147.5" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="898.00" y="1663.5" >v8::internal::Exec..</text>
+</g>
+<g >
+<title>v8::Function::Call (13 samples, 54.17%)</title><rect x="255.8" y="1845" width="639.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="258.83" y="1855.5" >v8::Function::Call</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="59.2" y="1381" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="62.17" y="1391.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="59.2" y="1653" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="62.17" y="1663.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="993.3" y="933" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="996.33" y="943.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="993.3" y="805" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="996.33" y="815.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="452.5" y="1285" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="455.50" y="1295.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="354.2" y="757" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="357.17" y="767.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="452.5" y="1333" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="455.50" y="1343.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="1429" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="1439.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="59.2" y="1333" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="62.17" y="1343.5" >Buil..</text>
+</g>
+<g >
+<title>uv__work_done (1 samples, 4.17%)</title><rect x="10.0" y="1957" width="49.2" height="15.0" fill="rgb(223,84,84)" rx="2" ry="2" />
+<text  x="13.00" y="1967.5" >uv__..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="59.2" y="1077" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="62.17" y="1087.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="993.3" y="1445" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="996.33" y="1455.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="403.3" y="725" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="406.33" y="735.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:ArgumentsAdaptorTrampoline (1 samples, 4.17%)</title><rect x="993.3" y="981" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="996.33" y="991.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="993.3" y="773" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="996.33" y="783.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="1525" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="1535.5" >Buil..</text>
+</g>
+<g >
+<title>Handler:UnknownBytecodeHadler (1 samples, 4.17%)</title><rect x="59.2" y="1317" width="49.1" height="15.0" fill="rgb(92,203,203)" rx="2" ry="2" />
+<text  x="62.17" y="1327.5" >Hand..</text>
+</g>
+<g >
+<title>Builtin:ArgumentsAdaptorTrampoline (1 samples, 4.17%)</title><rect x="993.3" y="885" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="996.33" y="895.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:JSEntryTrampoline (13 samples, 54.17%)</title><rect x="255.8" y="1797" width="639.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="258.83" y="1807.5" >Builtin:JSEntryTrampoline</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="1669" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="1679.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:ArgumentsAdaptorTrampoline (2 samples, 8.33%)</title><rect x="354.2" y="837" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="357.17" y="847.5" >Builtin:Arg..</text>
+</g>
+<g >
+<title>v8::internal::LoadIC::Load (1 samples, 4.17%)</title><rect x="600.0" y="1333" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="603.00" y="1343.5" >v8::..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="309" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="319.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:RunMicrotasks (13 samples, 54.17%)</title><rect x="255.8" y="1669" width="639.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="258.83" y="1679.5" >Builtin:RunMicrotasks</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="59.2" y="1237" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="62.17" y="1247.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="354.2" y="1461" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="357.17" y="1471.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (8 samples, 33.33%)</title><rect x="305.0" y="1605" width="393.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="308.00" y="1615.5" >Builtin:InterpreterEntryTrampoline</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="354.2" y="853" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="357.17" y="863.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>uv__read (1 samples, 4.17%)</title><rect x="1140.8" y="2037" width="49.2" height="15.0" fill="rgb(223,84,84)" rx="2" ry="2" />
+<text  x="1143.83" y="2047.5" >uv__..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="1413" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="1423.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="993.3" y="1237" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="996.33" y="1247.5" >Buil..</text>
+</g>
+<g >
+<title>node::Environment::RunAndClearNativeImmediates (1 samples, 4.17%)</title><rect x="1042.5" y="1957" width="49.2" height="15.0" fill="rgb(225,225,68)" rx="2" ry="2" />
+<text  x="1045.50" y="1967.5" >node..</text>
+</g>
+<g >
+<title>Builtin:ArgumentsAdaptorTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="1061" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="1071.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="805" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="815.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:ArgumentsAdaptorTrampoline (1 samples, 4.17%)</title><rect x="305.0" y="1477" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="308.00" y="1487.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="1381" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="1391.5" >Buil..</text>
+</g>
+<g >
+<title>v8::internal::interpreter::BytecodeRegisterOptimizer::RegisterListFreeEvent (1 samples, 4.17%)</title><rect x="452.5" y="1013" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="455.50" y="1023.5" >v8::..</text>
+</g>
+<g >
+<title>Handler:UnknownBytecodeHadler (1 samples, 4.17%)</title><rect x="550.8" y="1349" width="49.2" height="15.0" fill="rgb(92,203,203)" rx="2" ry="2" />
+<text  x="553.83" y="1359.5" >Hand..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="885" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="895.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="869" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="879.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:PromiseFulfillReactionJob (3 samples, 12.50%)</title><rect x="895.0" y="1605" width="147.5" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="898.00" y="1615.5" >Builtin:PromiseFul..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="354.2" y="1205" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="357.17" y="1215.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="773" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="783.5" >Buil..</text>
+</g>
+<g >
+<title>v8::internal::Object::GetPropertyWithAccessor (1 samples, 4.17%)</title><rect x="895.0" y="1349" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="898.00" y="1359.5" >v8::..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="59.2" y="1701" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="62.17" y="1711.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="1509" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="1519.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="59.2" y="1157" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="62.17" y="1167.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="789" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="799.5" >Buil..</text>
+</g>
+<g >
+<title>v8::internal::(anonymous namespace)::HandleApiCallHelper&lt;false&gt; (3 samples, 12.50%)</title><rect x="895.0" y="1685" width="147.5" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="898.00" y="1695.5" >v8::internal::(ano..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="213" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="223.5" >Buil..</text>
+</g>
+<g >
+<title>Stub:JSEntryStub (3 samples, 12.50%)</title><rect x="895.0" y="1637" width="147.5" height="15.0" fill="rgb(88,200,200)" rx="2" ry="2" />
+<text  x="898.00" y="1647.5" >Stub:JSEntryStub</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="403.3" y="741" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="406.33" y="751.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="10.0" y="1717" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="13.00" y="1727.5" >Buil..</text>
+</g>
+<g >
+<title>uv__run_timers (1 samples, 4.17%)</title><rect x="1091.7" y="1989" width="49.1" height="15.0" fill="rgb(223,84,84)" rx="2" ry="2" />
+<text  x="1094.67" y="1999.5" >uv__..</text>
+</g>
+<g >
+<title>v8::internal::Compiler::CompileOptimized (1 samples, 4.17%)</title><rect x="10.0" y="1605" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="13.00" y="1615.5" >v8::..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="993.3" y="1333" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="996.33" y="1343.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="895.0" y="1525" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="898.00" y="1535.5" >Buil..</text>
+</g>
+<g >
+<title>v8::internal::Execution::RunMicrotasks (13 samples, 54.17%)</title><rect x="255.8" y="1701" width="639.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="258.83" y="1711.5" >v8::internal::Execution::RunMicrotasks</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="993.3" y="1461" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="996.33" y="1471.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:JSBuiltinsConstructStub (5 samples, 20.83%)</title><rect x="452.5" y="1573" width="245.8" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="455.50" y="1583.5" >Builtin:JSBuiltinsConstructStub</text>
+</g>
+<g >
+<title>Handler:UnknownBytecodeHadler (1 samples, 4.17%)</title><rect x="108.3" y="1733" width="49.2" height="15.0" fill="rgb(92,203,203)" rx="2" ry="2" />
+<text  x="111.33" y="1743.5" >Hand..</text>
+</g>
+<g >
+<title>v8::internal::Object::GetProperty (1 samples, 4.17%)</title><rect x="895.0" y="1365" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="898.00" y="1375.5" >v8::..</text>
+</g>
+<g >
+<title>v8::internal::OptimizedCompilationJob::PrepareJob (1 samples, 4.17%)</title><rect x="10.0" y="1573" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="13.00" y="1583.5" >v8::..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="59.2" y="1365" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="62.17" y="1375.5" >Buil..</text>
+</g>
+<g >
+<title>node::InternalMakeCallback (1 samples, 4.17%)</title><rect x="206.7" y="1877" width="49.1" height="15.0" fill="rgb(225,225,68)" rx="2" ry="2" />
+<text  x="209.67" y="1887.5" >node..</text>
+</g>
+<g >
+<title>v8::internal::Runtime_ForInEnumerate (1 samples, 4.17%)</title><rect x="845.8" y="709" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="848.83" y="719.5" >v8::..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="1541" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="1551.5" >Buil..</text>
+</g>
+<g >
+<title>v8::internal::Heap::AllocateRawWithRetryOrFail (1 samples, 4.17%)</title><rect x="698.3" y="1285" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="701.33" y="1295.5" >v8::..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="354.2" y="885" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="357.17" y="895.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="1237" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="1247.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="1045" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="1055.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="1349" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="1359.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="993.3" y="901" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="996.33" y="911.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="59.2" y="1189" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="62.17" y="1199.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="1317" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="1327.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="661" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="671.5" >Buil..</text>
+</g>
+<g >
+<title>v8::internal::Compiler::Compile (1 samples, 4.17%)</title><rect x="452.5" y="1173" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="455.50" y="1183.5" >v8::..</text>
+</g>
+<g >
+<title>do_syscall_64 (1 samples, 4.17%)</title><rect x="698.3" y="1141" width="49.2" height="15.0" fill="rgb(243,143,0)" rx="2" ry="2" />
+<text  x="701.33" y="1151.5" >do_s..</text>
+</g>
+<g >
+<title>v8::internal::compiler::Typer::Run (1 samples, 4.17%)</title><rect x="10.0" y="1509" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="13.00" y="1519.5" >v8::..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="917" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="927.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="1205" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="1215.5" >Buil..</text>
+</g>
+<g >
+<title>node::TLSWrap::OnStreamRead (3 samples, 12.50%)</title><rect x="895.0" y="1925" width="147.5" height="15.0" fill="rgb(225,225,68)" rx="2" ry="2" />
+<text  x="898.00" y="1935.5" >node::TLSWrap::OnS..</text>
+</g>
+<g >
+<title>Builtin:KeyedLoadIC_Megamorphic (1 samples, 4.17%)</title><rect x="747.5" y="1541" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="750.50" y="1551.5" >Buil..</text>
+</g>
+<g >
+<title>Handler:UnknownBytecodeHadler (1 samples, 4.17%)</title><rect x="747.5" y="1557" width="49.2" height="15.0" fill="rgb(92,203,203)" rx="2" ry="2" />
+<text  x="750.50" y="1567.5" >Hand..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="773" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="783.5" >Buil..</text>
+</g>
+<g >
+<title>node::InternalCallbackScope::Close (1 samples, 4.17%)</title><rect x="10.0" y="1893" width="49.2" height="15.0" fill="rgb(225,225,68)" rx="2" ry="2" />
+<text  x="13.00" y="1903.5" >node..</text>
+</g>
+<g >
+<title>v8::internal::compiler::GraphReducer::Reduce (1 samples, 4.17%)</title><rect x="10.0" y="1461" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="13.00" y="1471.5" >v8::..</text>
+</g>
+<g >
+<title>v8::internal::Runtime_CompileOptimized_Concurrent (1 samples, 4.17%)</title><rect x="10.0" y="1621" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="13.00" y="1631.5" >v8::..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="501.7" y="1221" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="504.67" y="1231.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (5 samples, 20.83%)</title><rect x="452.5" y="1525" width="245.8" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="455.50" y="1535.5" >Builtin:InterpreterEntryTrampoline</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (3 samples, 12.50%)</title><rect x="452.5" y="1365" width="147.5" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="455.50" y="1375.5" >Builtin:Interprete..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="1429" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="1439.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:ArgumentsAdaptorTrampoline (3 samples, 12.50%)</title><rect x="452.5" y="1413" width="147.5" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="455.50" y="1423.5" >Builtin:ArgumentsA..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (5 samples, 20.83%)</title><rect x="452.5" y="1509" width="245.8" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="455.50" y="1519.5" >Builtin:InterpreterEntryTrampoline</text>
+</g>
+<g >
+<title>Handler:UnknownBytecodeHadler (1 samples, 4.17%)</title><rect x="698.3" y="1413" width="49.2" height="15.0" fill="rgb(92,203,203)" rx="2" ry="2" />
+<text  x="701.33" y="1423.5" >Hand..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="1589" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="1599.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="354.2" y="1221" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="357.17" y="1231.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="1493" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="1503.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:CEntry_Return1_DontSaveFPRegs_ArgvOnStack_NoBuiltinExit (1 samples, 4.17%)</title><rect x="1140.8" y="1797" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="1807.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="1285" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="1295.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="649.2" y="1333" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="652.17" y="1343.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="600.0" y="1397" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="603.00" y="1407.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>Builtin:ArgumentsAdaptorTrampoline (1 samples, 4.17%)</title><rect x="10.0" y="1669" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="13.00" y="1679.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:GeneratorPrototypeNext (2 samples, 8.33%)</title><rect x="354.2" y="1077" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="357.17" y="1087.5" >Builtin:Gen..</text>
+</g>
+<g >
+<title>Handler:UnknownBytecodeHadler (2 samples, 8.33%)</title><rect x="600.0" y="1381" width="98.3" height="15.0" fill="rgb(92,203,203)" rx="2" ry="2" />
+<text  x="603.00" y="1391.5" >Handler:Unk..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="59.2" y="1605" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="62.17" y="1615.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="693" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="703.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:JSEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="1829" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="1839.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="853" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="863.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="1237" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="1247.5" >Buil..</text>
+</g>
+<g >
+<title>v8::internal::compiler::PipelineImpl::Run&lt;v8::internal::compiler::TyperPhase, v8::internal::compiler::Typer*&gt; (1 samples, 4.17%)</title><rect x="10.0" y="1525" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="13.00" y="1535.5" >v8::..</text>
+</g>
+<g >
+<title>Builtin:CEntry_Return1_DontSaveFPRegs_ArgvOnStack_NoBuiltinExit (1 samples, 4.17%)</title><rect x="354.2" y="661" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="357.17" y="671.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="917" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="927.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="837" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="847.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="59.2" y="1717" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="62.17" y="1727.5" >Buil..</text>
+</g>
+<g >
+<title>Stub:JSEntryStub (3 samples, 12.50%)</title><rect x="895.0" y="1765" width="147.5" height="15.0" fill="rgb(88,200,200)" rx="2" ry="2" />
+<text  x="898.00" y="1775.5" >Stub:JSEntryStub</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="59.2" y="1637" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="62.17" y="1647.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="901" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="911.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="981" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="991.5" >Buil..</text>
+</g>
+<g >
+<title>Handler:UnknownBytecodeHadler (1 samples, 4.17%)</title><rect x="895.0" y="1253" width="49.2" height="15.0" fill="rgb(92,203,203)" rx="2" ry="2" />
+<text  x="898.00" y="1263.5" >Hand..</text>
+</g>
+<g >
+<title>uv__stream_io (20 samples, 83.33%)</title><rect x="59.2" y="1973" width="983.3" height="15.0" fill="rgb(223,84,84)" rx="2" ry="2" />
+<text  x="62.17" y="1983.5" >uv__stream_io</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="993.3" y="1365" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="996.33" y="1375.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="59.2" y="1061" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="62.17" y="1071.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="452.5" y="1253" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="455.50" y="1263.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>node::InternalMakeCallback (3 samples, 12.50%)</title><rect x="895.0" y="1845" width="147.5" height="15.0" fill="rgb(225,225,68)" rx="2" ry="2" />
+<text  x="898.00" y="1855.5" >node::InternalMake..</text>
+</g>
+<g >
+<title>v8::internal::(anonymous namespace)::HandleApiCallHelper&lt;false&gt; (13 samples, 54.17%)</title><rect x="255.8" y="1733" width="639.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="258.83" y="1743.5" >v8::internal::(anonymous namespace)::HandleApiCallHelper&lt;false&gt;</text>
+</g>
+<g >
+<title>v8::internal::Execution::Call (1 samples, 4.17%)</title><rect x="1140.8" y="1861" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="1143.83" y="1871.5" >v8::..</text>
+</g>
+<g >
+<title>node::InternalMakeCallback (3 samples, 12.50%)</title><rect x="59.2" y="1861" width="147.5" height="15.0" fill="rgb(225,225,68)" rx="2" ry="2" />
+<text  x="62.17" y="1871.5" >node::InternalMake..</text>
+</g>
+<g >
+<title>Stub:JSEntryStub (13 samples, 54.17%)</title><rect x="255.8" y="1813" width="639.2" height="15.0" fill="rgb(88,200,200)" rx="2" ry="2" />
+<text  x="258.83" y="1823.5" >Stub:JSEntryStub</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="59.2" y="1733" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="62.17" y="1743.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="354.2" y="1237" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="357.17" y="1247.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="59.2" y="1269" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="62.17" y="1279.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="747.5" y="1525" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="750.50" y="1535.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="229" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="239.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="59.2" y="1397" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="62.17" y="1407.5" >Buil..</text>
+</g>
+<g >
+<title>page_add_new_anon_rmap (1 samples, 4.17%)</title><rect x="895.0" y="1109" width="49.2" height="15.0" fill="rgb(231,131,0)" rx="2" ry="2" />
+<text  x="898.00" y="1119.5" >page..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="354.2" y="1397" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="357.17" y="1407.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>v8::internal::Runtime_CompileLazy (1 samples, 4.17%)</title><rect x="452.5" y="1189" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="455.50" y="1199.5" >v8::..</text>
+</g>
+<g >
+<title>Builtin:ArgumentsAdaptorTrampoline (1 samples, 4.17%)</title><rect x="993.3" y="1013" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="996.33" y="1023.5" >Buil..</text>
+</g>
+<g >
+<title>v8::internal::ScavengingTask::RunInParallel (1 samples, 4.17%)</title><rect x="698.3" y="1189" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="701.33" y="1199.5" >v8::..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="10.0" y="1781" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="13.00" y="1791.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="354.2" y="1429" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="357.17" y="1439.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="698.3" y="1557" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="701.33" y="1567.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="993.3" y="1173" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="996.33" y="1183.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="629" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="639.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="944.2" y="1573" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="947.17" y="1583.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>node (24 samples, 100.00%)</title><rect x="10.0" y="2069" width="1180.0" height="15.0" fill="rgb(250,123,123)" rx="2" ry="2" />
+<text  x="13.00" y="2079.5" >node</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="1109" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="1119.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:CEntry_Return1_DontSaveFPRegs_ArgvOnStack_NoBuiltinExit (1 samples, 4.17%)</title><rect x="452.5" y="1205" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="455.50" y="1215.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="1189" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="1199.5" >Buil..</text>
+</g>
+<g >
+<title>v8::internal::FastKeyAccumulator::GetOwnKeysWithUninitializedEnumCache (1 samples, 4.17%)</title><rect x="501.7" y="1109" width="49.1" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="504.67" y="1119.5" >v8::..</text>
+</g>
+<g >
+<title>v8::internal::Object::GetProperty (1 samples, 4.17%)</title><rect x="600.0" y="1317" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="603.00" y="1327.5" >v8::..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="1605" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="1615.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:ArgumentsAdaptorTrampoline (1 samples, 4.17%)</title><rect x="993.3" y="1045" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="996.33" y="1055.5" >Buil..</text>
+</g>
+<g >
+<title>node::AsyncWrap::MakeCallback (1 samples, 4.17%)</title><rect x="10.0" y="1925" width="49.2" height="15.0" fill="rgb(225,225,68)" rx="2" ry="2" />
+<text  x="13.00" y="1935.5" >node..</text>
+</g>
+<g >
+<title>v8::internal::Object::GetPropertyWithDefinedGetter (1 samples, 4.17%)</title><rect x="895.0" y="1333" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="898.00" y="1343.5" >v8::..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="1621" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="1631.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="993.3" y="1221" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="996.33" y="1231.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="1045" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="1055.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="1541" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="1551.5" >Buil..</text>
+</g>
+<g >
+<title>v8::internal::interpreter::InterpreterCompilationJob::ExecuteJobImpl (1 samples, 4.17%)</title><rect x="452.5" y="1109" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="455.50" y="1119.5" >v8::..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="437" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="447.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="1189" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="1199.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="1413" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="1423.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="341" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="351.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="354.2" y="789" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="357.17" y="799.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="354.2" y="821" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="357.17" y="831.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>Builtin:ArgumentsAdaptorTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="997" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="1007.5" >Buil..</text>
+</g>
+<g >
+<title>v8::internal::Runtime_KeyedLoadIC_Miss (1 samples, 4.17%)</title><rect x="895.0" y="1413" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="898.00" y="1423.5" >v8::..</text>
+</g>
+<g >
+<title>node::LibuvStreamWrap::ReadStart (1 samples, 4.17%)</title><rect x="1140.8" y="2021" width="49.2" height="15.0" fill="rgb(225,225,68)" rx="2" ry="2" />
+<text  x="1143.83" y="2031.5" >node..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="649.2" y="1253" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="652.17" y="1263.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="1013" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="1023.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="993.3" y="869" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="996.33" y="879.5" >Buil..</text>
+</g>
+<g >
+<title>Stub:JSEntryStub (13 samples, 54.17%)</title><rect x="255.8" y="1685" width="639.2" height="15.0" fill="rgb(88,200,200)" rx="2" ry="2" />
+<text  x="258.83" y="1695.5" >Stub:JSEntryStub</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="944.2" y="1557" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="947.17" y="1567.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="1253" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="1263.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="1157" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="1167.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="354.2" y="1013" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="357.17" y="1023.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="1461" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="1471.5" >Buil..</text>
+</g>
+<g >
+<title>v8::internal::Builtin_HandleApiCall (1 samples, 4.17%)</title><rect x="944.2" y="1461" width="49.1" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="947.17" y="1471.5" >v8::..</text>
+</g>
+<g >
+<title>node::(anonymous namespace)::Parser::Proxy&lt;int  (4 samples, 16.67%)</title><rect x="59.2" y="1893" width="196.6" height="15.0" fill="rgb(225,225,68)" rx="2" ry="2" />
+<text  x="62.17" y="1903.5" >node::(anonymous namespac..</text>
+</g>
+<g >
+<title>Builtin:ArgumentsAdaptorTrampoline (1 samples, 4.17%)</title><rect x="354.2" y="741" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="357.17" y="751.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="645" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="655.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:JSConstructStubGeneric (1 samples, 4.17%)</title><rect x="649.2" y="1365" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="652.17" y="1375.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:CEntry_Return1_DontSaveFPRegs_ArgvOnStack_NoBuiltinExit (1 samples, 4.17%)</title><rect x="10.0" y="1637" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="13.00" y="1647.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:ArgumentsAdaptorTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="933" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="943.5" >Buil..</text>
+</g>
+<g >
+<title>v8::internal::KeyedLoadIC::Load (1 samples, 4.17%)</title><rect x="993.3" y="661" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="996.33" y="671.5" >v8::..</text>
+</g>
+<g >
+<title>Builtin:JSBuiltinsConstructStub (5 samples, 20.83%)</title><rect x="452.5" y="1477" width="245.8" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="455.50" y="1487.5" >Builtin:JSBuiltinsConstructStub</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="1477" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="1487.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="993.3" y="1301" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="996.33" y="1311.5" >Buil..</text>
+</g>
+<g >
+<title>uv_timer_stop (1 samples, 4.17%)</title><rect x="1091.7" y="1973" width="49.1" height="15.0" fill="rgb(223,84,84)" rx="2" ry="2" />
+<text  x="1094.67" y="1983.5" >uv_t..</text>
+</g>
+<g >
+<title>v8::internal::Map::NumberOfEnumerableProperties (1 samples, 4.17%)</title><rect x="845.8" y="597" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="848.83" y="607.5" >v8::..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="485" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="495.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="698.3" y="1509" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="701.33" y="1519.5" >Buil..</text>
+</g>
+<g >
+<title>v8::internal::(anonymous namespace)::GetOptimizedCode (1 samples, 4.17%)</title><rect x="10.0" y="1589" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="13.00" y="1599.5" >v8::..</text>
+</g>
+<g >
+<title>v8::internal::Compiler::Compile (1 samples, 4.17%)</title><rect x="452.5" y="1157" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="455.50" y="1167.5" >v8::..</text>
+</g>
+<g >
+<title>v8::internal::compiler::Typer::Visitor::UpdateType (1 samples, 4.17%)</title><rect x="10.0" y="1445" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="13.00" y="1455.5" >v8::..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="1141" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="1151.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:ArgumentsAdaptorTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="1125" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="1135.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="741" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="751.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:ArgumentsAdaptorTrampoline (1 samples, 4.17%)</title><rect x="255.8" y="1541" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="258.83" y="1551.5" >Buil..</text>
+</g>
+<g >
+<title>uv__async_io (1 samples, 4.17%)</title><rect x="10.0" y="1973" width="49.2" height="15.0" fill="rgb(223,84,84)" rx="2" ry="2" />
+<text  x="13.00" y="1983.5" >uv__..</text>
+</g>
+<g >
+<title>v8::internal::Execution::RunMicrotasks (1 samples, 4.17%)</title><rect x="1140.8" y="1733" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="1143.83" y="1743.5" >v8::..</text>
+</g>
+<g >
+<title>LazyCompile:*_addHeaderLine _http_incoming.js:277 (1 samples, 4.17%)</title><rect x="108.3" y="1749" width="49.2" height="15.0" fill="rgb(83,196,196)" rx="2" ry="2" />
+<text  x="111.33" y="1759.5" >Lazy..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="354.2" y="1365" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="357.17" y="1375.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>Builtin:ArgumentsAdaptorTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="149" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="159.5" >Buil..</text>
+</g>
+<g >
+<title>v8::internal::Heap::CollectGarbage (1 samples, 4.17%)</title><rect x="698.3" y="1269" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="701.33" y="1279.5" >v8::..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="1493" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="1503.5" >Buil..</text>
+</g>
+<g >
+<title>Stub:JSEntryStub (1 samples, 4.17%)</title><rect x="895.0" y="1301" width="49.2" height="15.0" fill="rgb(88,200,200)" rx="2" ry="2" />
+<text  x="898.00" y="1311.5" >Stub..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="1093" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="1103.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="101" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="111.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="59.2" y="1509" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="62.17" y="1519.5" >Buil..</text>
+</g>
+<g >
+<title>v8::internal::Execution::Call (1 samples, 4.17%)</title><rect x="895.0" y="1317" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="898.00" y="1327.5" >v8::..</text>
+</g>
+<g >
+<title>v8::internal::interpreter::BytecodeGenerator::GenerateBytecode (1 samples, 4.17%)</title><rect x="452.5" y="1093" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="455.50" y="1103.5" >v8::..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="10.0" y="1733" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="13.00" y="1743.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="993.3" y="1125" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="996.33" y="1135.5" >Buil..</text>
+</g>
+<g >
+<title>sys_futex (1 samples, 4.17%)</title><rect x="698.3" y="1125" width="49.2" height="15.0" fill="rgb(237,137,0)" rx="2" ry="2" />
+<text  x="701.33" y="1135.5" >sys_..</text>
+</g>
+<g >
+<title>Builtin:CEntry_Return1_DontSaveFPRegs_ArgvOnStack_NoBuiltinExit (1 samples, 4.17%)</title><rect x="845.8" y="725" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="735.5" >Buil..</text>
+</g>
+<g >
+<title>Handler:UnknownBytecodeHadler (1 samples, 4.17%)</title><rect x="354.2" y="677" width="49.1" height="15.0" fill="rgb(92,203,203)" rx="2" ry="2" />
+<text  x="357.17" y="687.5" >Hand..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="993.3" y="1381" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="996.33" y="1391.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="533" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="543.5" >Buil..</text>
+</g>
+<g >
+<title>__handle_mm_fault (1 samples, 4.17%)</title><rect x="895.0" y="1125" width="49.2" height="15.0" fill="rgb(226,126,0)" rx="2" ry="2" />
+<text  x="898.00" y="1135.5" >__ha..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="1365" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="1375.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="354.2" y="997" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="357.17" y="1007.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>Builtin:AsyncFunctionAwaitResolveClosure (9 samples, 37.50%)</title><rect x="255.8" y="1637" width="442.5" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="258.83" y="1647.5" >Builtin:AsyncFunctionAwaitResolveClosure</text>
+</g>
+<g >
+<title>Handler:UnknownBytecodeHadler (1 samples, 4.17%)</title><rect x="796.7" y="1605" width="49.1" height="15.0" fill="rgb(92,203,203)" rx="2" ry="2" />
+<text  x="799.67" y="1615.5" >Hand..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="993.3" y="1157" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="996.33" y="1167.5" >Buil..</text>
+</g>
+<g >
+<title>v8::internal::Heap::PerformGarbageCollection (1 samples, 4.17%)</title><rect x="698.3" y="1253" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="701.33" y="1263.5" >v8::..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="1077" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="1087.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="949" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="959.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:ArgumentsAdaptorTrampoline (1 samples, 4.17%)</title><rect x="255.8" y="1573" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="258.83" y="1583.5" >Buil..</text>
+</g>
+<g >
+<title>http_parser_execute (4 samples, 16.67%)</title><rect x="59.2" y="1909" width="196.6" height="15.0" fill="rgb(233,99,99)" rx="2" ry="2" />
+<text  x="62.17" y="1919.5" >http_parser_execute</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="993.3" y="789" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="996.33" y="799.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="405" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="415.5" >Buil..</text>
+</g>
+<g >
+<title>v8::internal::Execution::Call (3 samples, 12.50%)</title><rect x="59.2" y="1829" width="147.5" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="62.17" y="1839.5" >v8::internal::Exec..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="354.2" y="693" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="357.17" y="703.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:ArgumentsAdaptorTrampoline (1 samples, 4.17%)</title><rect x="993.3" y="917" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="996.33" y="927.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:CEntry_Return1_DontSaveFPRegs_ArgvOnStack_NoBuiltinExit (13 samples, 54.17%)</title><rect x="255.8" y="1765" width="639.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="258.83" y="1775.5" >Builtin:CEntry_Return1_DontSaveFPRegs_ArgvOnStack_NoBuiltinExit</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="993.3" y="1093" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="996.33" y="1103.5" >Buil..</text>
+</g>
+<g >
+<title>try_to_wake_up (1 samples, 4.17%)</title><rect x="698.3" y="1061" width="49.2" height="15.0" fill="rgb(234,134,0)" rx="2" ry="2" />
+<text  x="701.33" y="1071.5" >try_..</text>
+</g>
+<g >
+<title>Handler:UnknownBytecodeHadler (1 samples, 4.17%)</title><rect x="747.5" y="1509" width="49.2" height="15.0" fill="rgb(92,203,203)" rx="2" ry="2" />
+<text  x="750.50" y="1519.5" >Hand..</text>
+</g>
+<g >
+<title>Handler:UnknownBytecodeHadler (5 samples, 20.83%)</title><rect x="452.5" y="1589" width="245.8" height="15.0" fill="rgb(92,203,203)" rx="2" ry="2" />
+<text  x="455.50" y="1599.5" >Handler:UnknownBytecodeHadler</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="245" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="255.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:ArgumentsAdaptorTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="1093" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="1103.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:ArgumentsAdaptorTrampoline (1 samples, 4.17%)</title><rect x="59.2" y="1669" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="62.17" y="1679.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:JSBuiltinsConstructStub (1 samples, 4.17%)</title><rect x="59.2" y="1301" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="62.17" y="1311.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="1445" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="1455.5" >Buil..</text>
+</g>
+<g >
+<title>uv__run_check (1 samples, 4.17%)</title><rect x="1042.5" y="1989" width="49.2" height="15.0" fill="rgb(223,84,84)" rx="2" ry="2" />
+<text  x="1045.50" y="1999.5" >uv__..</text>
+</g>
+<g >
+<title>Stub:JSEntryStub (1 samples, 4.17%)</title><rect x="1140.8" y="1845" width="49.2" height="15.0" fill="rgb(88,200,200)" rx="2" ry="2" />
+<text  x="1143.83" y="1855.5" >Stub..</text>
+</g>
+<g >
+<title>v8::internal::JSReceiver::SetProperties (1 samples, 4.17%)</title><rect x="59.2" y="997" width="49.1" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="62.17" y="1007.5" >v8::..</text>
+</g>
+<g >
+<title>Stub:JSEntryStub (1 samples, 4.17%)</title><rect x="10.0" y="1829" width="49.2" height="15.0" fill="rgb(88,200,200)" rx="2" ry="2" />
+<text  x="13.00" y="1839.5" >Stub..</text>
+</g>
+<g >
+<title>Builtin:ArgumentsAdaptorTrampoline (1 samples, 4.17%)</title><rect x="993.3" y="757" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="996.33" y="767.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (3 samples, 12.50%)</title><rect x="305.0" y="1573" width="147.5" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="308.00" y="1583.5" >Builtin:Interprete..</text>
+</g>
+<g >
+<title>node::InternalMakeCallback (13 samples, 54.17%)</title><rect x="255.8" y="1893" width="639.2" height="15.0" fill="rgb(225,225,68)" rx="2" ry="2" />
+<text  x="258.83" y="1903.5" >node::InternalMakeCallback</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="895.0" y="1461" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="898.00" y="1471.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="1653" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="1663.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:ArgumentsAdaptorTrampoline (2 samples, 8.33%)</title><rect x="354.2" y="773" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="357.17" y="783.5" >Builtin:Arg..</text>
+</g>
+<g >
+<title>Handler:UnknownBytecodeHadler (1 samples, 4.17%)</title><rect x="993.3" y="709" width="49.2" height="15.0" fill="rgb(92,203,203)" rx="2" ry="2" />
+<text  x="996.33" y="719.5" >Hand..</text>
+</g>
+<g >
+<title>Builtin:PromiseConstructor (5 samples, 20.83%)</title><rect x="452.5" y="1461" width="245.8" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="455.50" y="1471.5" >Builtin:PromiseConstructor</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="649.2" y="1269" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="652.17" y="1279.5" >Buil..</text>
+</g>
+<g >
+<title>v8::internal::Execution::Call (13 samples, 54.17%)</title><rect x="255.8" y="1829" width="639.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="258.83" y="1839.5" >v8::internal::Execution::Call</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="354.2" y="901" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="357.17" y="911.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="59.2" y="1205" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="62.17" y="1215.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="1173" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="1183.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:GeneratorPrototypeNext (1 samples, 4.17%)</title><rect x="895.0" y="1573" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="898.00" y="1583.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="853" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="863.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="59.2" y="1765" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="62.17" y="1775.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="993.3" y="1477" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="996.33" y="1487.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="949" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="959.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="613" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="623.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="757" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="767.5" >Buil..</text>
+</g>
+<g >
+<title>uv__stream_io (1 samples, 4.17%)</title><rect x="1140.8" y="2053" width="49.2" height="15.0" fill="rgb(223,84,84)" rx="2" ry="2" />
+<text  x="1143.83" y="2063.5" >uv__..</text>
+</g>
+<g >
+<title>Stub:JSEntryStub (1 samples, 4.17%)</title><rect x="1140.8" y="1717" width="49.2" height="15.0" fill="rgb(88,200,200)" rx="2" ry="2" />
+<text  x="1143.83" y="1727.5" >Stub..</text>
+</g>
+<g >
+<title>Builtin:ArgumentsAdaptorTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="117" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="127.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="354.2" y="1477" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="357.17" y="1487.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>pthread_cond_broadcast@@GLIBC_2.3.2 (1 samples, 4.17%)</title><rect x="698.3" y="1173" width="49.2" height="15.0" fill="rgb(237,104,104)" rx="2" ry="2" />
+<text  x="701.33" y="1183.5" >pthr..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="821" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="831.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="10.0" y="1653" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="13.00" y="1663.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="1077" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="1087.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="549" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="559.5" >Buil..</text>
+</g>
+<g >
+<title>node::AsyncWrap::MakeCallback (3 samples, 12.50%)</title><rect x="895.0" y="1861" width="147.5" height="15.0" fill="rgb(225,225,68)" rx="2" ry="2" />
+<text  x="898.00" y="1871.5" >node::AsyncWrap::M..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="1349" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="1359.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="944.2" y="1493" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="947.17" y="1503.5" >Buil..</text>
+</g>
+<g >
+<title>v8::internal::interpreter::BytecodeGenerator::VisitCall (1 samples, 4.17%)</title><rect x="452.5" y="1029" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="455.50" y="1039.5" >v8::..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="677" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="687.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="993.3" y="837" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="996.33" y="847.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="698.3" y="1493" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="701.33" y="1503.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="452.5" y="1317" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="455.50" y="1327.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="698.3" y="1429" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="701.33" y="1439.5" >Buil..</text>
+</g>
+<g >
+<title>v8::internal::Builtin_HandleApiCall (13 samples, 54.17%)</title><rect x="255.8" y="1749" width="639.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="258.83" y="1759.5" >v8::internal::Builtin_HandleApiCall</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="357" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="367.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:ArgumentsAdaptorTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="1029" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="1039.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="993.3" y="1253" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="996.33" y="1263.5" >Buil..</text>
+</g>
+<g >
+<title>node::fs::Read (1 samples, 4.17%)</title><rect x="944.2" y="1429" width="49.1" height="15.0" fill="rgb(225,225,68)" rx="2" ry="2" />
+<text  x="947.17" y="1439.5" >node..</text>
+</g>
+<g >
+<title>node::InternalMakeCallback (1 samples, 4.17%)</title><rect x="10.0" y="1909" width="49.2" height="15.0" fill="rgb(225,225,68)" rx="2" ry="2" />
+<text  x="13.00" y="1919.5" >node..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="993.3" y="965" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="996.33" y="975.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="565" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="575.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="895.0" y="1221" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="898.00" y="1231.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="600.0" y="1413" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="603.00" y="1423.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="133" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="143.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="1461" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="1471.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="452.5" y="1237" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="455.50" y="1247.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="197" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="207.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (3 samples, 12.50%)</title><rect x="895.0" y="1733" width="147.5" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="898.00" y="1743.5" >Builtin:Interprete..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="59.2" y="1573" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="62.17" y="1583.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:PromiseFulfillReactionJob (13 samples, 54.17%)</title><rect x="255.8" y="1653" width="639.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="258.83" y="1663.5" >Builtin:PromiseFulfillReactionJob</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="325" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="335.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:GeneratorPrototypeNext (2 samples, 8.33%)</title><rect x="354.2" y="1045" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="357.17" y="1055.5" >Builtin:Gen..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (4 samples, 16.67%)</title><rect x="698.3" y="1637" width="196.7" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="701.33" y="1647.5" >Builtin:InterpreterEntryT..</text>
+</g>
+<g >
+<title>v8::internal::interpreter::BytecodeGenerator::VisitForEffect (1 samples, 4.17%)</title><rect x="452.5" y="1045" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="455.50" y="1055.5" >v8::..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="1301" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="1311.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (3 samples, 12.50%)</title><rect x="305.0" y="1541" width="147.5" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="308.00" y="1551.5" >Builtin:Interprete..</text>
+</g>
+<g >
+<title>Builtin:ArgumentsAdaptorTrampoline (1 samples, 4.17%)</title><rect x="59.2" y="1221" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="62.17" y="1231.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:CEntry_Return1_DontSaveFPRegs_ArgvOnStack_NoBuiltinExit (1 samples, 4.17%)</title><rect x="698.3" y="1381" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="701.33" y="1391.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="895.0" y="1237" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="898.00" y="1247.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="373" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="383.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:ArgumentsAdaptorTrampoline (1 samples, 4.17%)</title><rect x="944.2" y="1509" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="947.17" y="1519.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="993.3" y="725" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="996.33" y="735.5" >Buil..</text>
+</g>
+<g >
+<title>v8::internal::compiler::PipelineCompilationJob::PrepareJobImpl (1 samples, 4.17%)</title><rect x="10.0" y="1557" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="13.00" y="1567.5" >v8::..</text>
+</g>
+<g >
+<title>v8::internal::compiler::GraphReducer::ReduceTop (1 samples, 4.17%)</title><rect x="10.0" y="1477" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="13.00" y="1487.5" >v8::..</text>
+</g>
+<g >
+<title>v8::Function::Call (1 samples, 4.17%)</title><rect x="1140.8" y="1893" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="1143.83" y="1903.5" >v8::..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="452.5" y="1349" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="455.50" y="1359.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>BytecodeHandler:ForInEnumerate (1 samples, 4.17%)</title><rect x="501.7" y="1189" width="49.1" height="15.0" fill="rgb(90,202,202)" rx="2" ry="2" />
+<text  x="504.67" y="1199.5" >Byte..</text>
+</g>
+<g >
+<title>Builtin:RunMicrotasks (3 samples, 12.50%)</title><rect x="895.0" y="1621" width="147.5" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="898.00" y="1631.5" >Builtin:RunMicrota..</text>
+</g>
+<g >
+<title>Builtin:CallFunction_ReceiverIsAny (1 samples, 4.17%)</title><rect x="255.8" y="1525" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="258.83" y="1535.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="1205" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="1215.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="1509" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="1519.5" >Buil..</text>
+</g>
+<g >
+<title>v8::internal::StoreIC::Store (1 samples, 4.17%)</title><rect x="354.2" y="629" width="49.1" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="357.17" y="639.5" >v8::..</text>
+</g>
+<g >
+<title>v8::internal::FastKeyAccumulator::GetKeysFast (1 samples, 4.17%)</title><rect x="501.7" y="1125" width="49.1" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="504.67" y="1135.5" >v8::..</text>
+</g>
+<g >
+<title>node::Start (23 samples, 95.83%)</title><rect x="10.0" y="2037" width="1130.8" height="15.0" fill="rgb(225,225,68)" rx="2" ry="2" />
+<text  x="13.00" y="2047.5" >node::Start</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (5 samples, 20.83%)</title><rect x="452.5" y="1429" width="245.8" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="455.50" y="1439.5" >Builtin:InterpreterEntryTrampoline</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="354.2" y="725" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="357.17" y="735.5" >Buil..</text>
+</g>
+<g >
+<title>v8::Function::Call (3 samples, 12.50%)</title><rect x="895.0" y="1797" width="147.5" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="898.00" y="1807.5" >v8::Function::Call</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="1061" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="1071.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="885" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="895.5" >Buil..</text>
+</g>
+<g >
+<title>Handler:UnknownBytecodeHadler (1 samples, 4.17%)</title><rect x="895.0" y="1509" width="49.2" height="15.0" fill="rgb(92,203,203)" rx="2" ry="2" />
+<text  x="898.00" y="1519.5" >Hand..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="997" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="1007.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="944.2" y="1541" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="947.17" y="1551.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="698.3" y="1573" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="701.33" y="1583.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="993.3" y="1189" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="996.33" y="1199.5" >Buil..</text>
+</g>
+<g >
+<title>v8::internal::LoadIC::Load (1 samples, 4.17%)</title><rect x="895.0" y="1381" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="898.00" y="1391.5" >v8::..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="181" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="191.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="421" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="431.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:RunMicrotasks (1 samples, 4.17%)</title><rect x="1140.8" y="1701" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="1711.5" >Buil..</text>
+</g>
+<g >
+<title>v8::internal::ApiNatives::InstantiateObject (1 samples, 4.17%)</title><rect x="698.3" y="1333" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="701.33" y="1343.5" >v8::..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="597" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="607.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="59.2" y="1093" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="62.17" y="1103.5" >Buil..</text>
+</g>
+<g >
+<title>Handler:UnknownBytecodeHadler (1 samples, 4.17%)</title><rect x="305.0" y="1429" width="49.2" height="15.0" fill="rgb(92,203,203)" rx="2" ry="2" />
+<text  x="308.00" y="1439.5" >Hand..</text>
+</g>
+<g >
+<title>Handler:UnknownBytecodeHadler (5 samples, 20.83%)</title><rect x="452.5" y="1493" width="245.8" height="15.0" fill="rgb(92,203,203)" rx="2" ry="2" />
+<text  x="455.50" y="1503.5" >Handler:UnknownBytecodeHadler</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="59.2" y="1141" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="62.17" y="1151.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="993.3" y="997" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="996.33" y="1007.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="1637" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="1647.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="59.2" y="1125" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="62.17" y="1135.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:CEntry_Return1_DontSaveFPRegs_ArgvOnStack_NoBuiltinExit (1 samples, 4.17%)</title><rect x="600.0" y="1365" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="603.00" y="1375.5" >Buil..</text>
+</g>
+<g >
+<title>node::InternalCallbackScope::Close (13 samples, 54.17%)</title><rect x="255.8" y="1877" width="639.2" height="15.0" fill="rgb(225,225,68)" rx="2" ry="2" />
+<text  x="258.83" y="1887.5" >node::InternalCallbackScope::Close</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="1525" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="1535.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:PromiseFulfillReactionJob (1 samples, 4.17%)</title><rect x="1140.8" y="1685" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="1695.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:CEntry_Return1_DontSaveFPRegs_ArgvOnStack_NoBuiltinExit (1 samples, 4.17%)</title><rect x="501.7" y="1173" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="504.67" y="1183.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="354.2" y="949" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="357.17" y="959.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="59.2" y="1493" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="62.17" y="1503.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="255.8" y="1589" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="258.83" y="1599.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="354.2" y="981" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="357.17" y="991.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="469" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="479.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="747.5" y="1573" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="750.50" y="1583.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:ArgumentsAdaptorTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="965" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="975.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (9 samples, 37.50%)</title><rect x="255.8" y="1621" width="442.5" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="258.83" y="1631.5" >Builtin:InterpreterEntryTrampoline</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="1573" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="1583.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="501.7" y="1205" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="504.67" y="1215.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="59.2" y="1413" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="62.17" y="1423.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:JSEntryTrampoline (1 samples, 4.17%)</title><rect x="10.0" y="1813" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="13.00" y="1823.5" >Buil..</text>
+</g>
+<g >
+<title>Handler:UnknownBytecodeHadler (1 samples, 4.17%)</title><rect x="747.5" y="1589" width="49.2" height="15.0" fill="rgb(92,203,203)" rx="2" ry="2" />
+<text  x="750.50" y="1599.5" >Hand..</text>
+</g>
+<g >
+<title>v8::Function::Call (13 samples, 54.17%)</title><rect x="255.8" y="1861" width="639.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="258.83" y="1871.5" >v8::Function::Call</text>
+</g>
+<g >
+<title>v8::internal::Isolate::RunMicrotasks (3 samples, 12.50%)</title><rect x="895.0" y="1669" width="147.5" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="898.00" y="1679.5" >v8::internal::Isol..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="10.0" y="1749" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="13.00" y="1759.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="993.3" y="1397" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="996.33" y="1407.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="845.8" y="1221" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="848.83" y="1231.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="649.2" y="1285" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="652.17" y="1295.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="354.2" y="1413" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="357.17" y="1423.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>v8::internal::LookupIterator::Start&lt;false&gt; (1 samples, 4.17%)</title><rect x="354.2" y="613" width="49.1" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="357.17" y="623.5" >v8::..</text>
+</g>
+<g >
+<title>v8::internal::Runtime_KeyedLoadIC_Miss (1 samples, 4.17%)</title><rect x="993.3" y="677" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="996.33" y="687.5" >v8::..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="59.2" y="1557" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="62.17" y="1567.5" >Buil..</text>
+</g>
+<g >
+<title>v8::internal::interpreter::BytecodeGenerator::VisitStatements (1 samples, 4.17%)</title><rect x="452.5" y="1061" width="49.2" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="455.50" y="1071.5" >v8::..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="69" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="79.5" >Buil..</text>
+</g>
+<g >
+<title>v8::internal::BinarySearch&lt; (1 samples, 4.17%)</title><rect x="354.2" y="581" width="49.1" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="357.17" y="591.5" >v8::..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (3 samples, 12.50%)</title><rect x="895.0" y="1589" width="147.5" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="898.00" y="1599.5" >Builtin:Interprete..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="1140.8" y="933" width="49.2" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="1143.83" y="943.5" >Buil..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (2 samples, 8.33%)</title><rect x="354.2" y="1125" width="98.3" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="357.17" y="1135.5" >Builtin:Int..</text>
+</g>
+<g >
+<title>Builtin:InterpreterEntryTrampoline (1 samples, 4.17%)</title><rect x="59.2" y="1173" width="49.1" height="15.0" fill="rgb(80,193,193)" rx="2" ry="2" />
+<text  x="62.17" y="1183.5" >Buil..</text>
+</g>
+<g >
+<title>v8::internal::Builtin_HandleApiCall (3 samples, 12.50%)</title><rect x="895.0" y="1701" width="147.5" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="898.00" y="1711.5" >v8::internal::Buil..</text>
+</g>
+<g >
+<title>Handler:UnknownBytecodeHadler (1 samples, 4.17%)</title><rect x="1140.8" y="37" width="49.2" height="15.0" fill="rgb(92,203,203)" rx="2" ry="2" />
+<text  x="1143.83" y="47.5" >Hand..</text>
+</g>
+<g >
+<title>all (24 samples, 100%)</title><rect x="10.0" y="2085" width="1180.0" height="15.0" fill="rgb(255,130,130)" rx="2" ry="2" />
+<text  x="13.00" y="2095.5" ></text>
+</g>
+<g >
+<title>v8::internal::FastKeyAccumulator::GetKeys (1 samples, 4.17%)</title><rect x="501.7" y="1141" width="49.1" height="15.0" fill="rgb(205,205,61)" rx="2" ry="2" />
+<text  x="504.67" y="1151.5" >v8::..</text>
+</g>
+</g>
+</svg>
